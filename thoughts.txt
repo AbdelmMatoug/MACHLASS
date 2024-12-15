@@ -1,0 +1,7 @@
+LINEAR REGRESSION MODEL : Very low MAPE ==> 0.24% (too low?)
+
+ARIMA MODEL (Time-series analysis) : linear rising trend (wrong?) use automatic arima tuning with auto_arima for d,p,q 
+d > 1 leads to over-differencing
+Seasonal = true, stepwise = true (does all possible combinations), trace = true (prints all in command)
+can make lower MAPE with d = 3, but this is because it destroys certain information from the data
+so best arima paremeters are (0,1,0) according to auto_arima
