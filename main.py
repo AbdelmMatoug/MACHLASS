@@ -1,81 +1,128 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.linear_model import LinearRegression
+import torch
+import torch.nn as nn
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_percentage_error
-import pmdarima as pm
 
-def preprocess_data(file_path):
-    """
-    Preprocess the input data.
-    """
-    data = pd.read_csv(file_path)
-    data['Date'] = pd.to_datetime(data['Date'])
-    features = ['Open', 'High', 'Low']
-    target = 'Last Close'
-    return data, features, target
-
-def calculate_mape(training_file, testing_file):
-    """
-    Train models using the training data and calculate MAPE on the testing data.
-    """
-    # Load and preprocess the data
-    training_data, features, target = preprocess_data(training_file)
-    testing_data, _, _ = preprocess_data(testing_file)
-
-    # Extract features and target
-    X_train = training_data[features]
-    y_train = training_data[target]
-    X_test = testing_data[features]
-    y_test = testing_data[target]
-
-    # **Linear Regression Model**
-    # Train the Linear Regression model
-    lr_model = LinearRegression()
-    lr_model.fit(X_train, y_train)
-
-    # Predict using the Linear Regression model
-    y_pred_lr = lr_model.predict(X_test)
-
-    # Calculate MAPE for Linear Regression
-    mape_lr = mean_absolute_percentage_error(y_test, y_pred_lr)
-    print(f"Linear Regression MAPE: {mape_lr * 100:.2f}%")
-
-    # **ARIMA Model (Auto ARIMA)**
-    # Automatically determine the best ARIMA parameters
-    arima_model = pm.auto_arima(training_data[target], seasonal=True, stepwise=False, trace=True)
-    print(f"Best ARIMA parameters: {arima_model.order}")
-
-    # Predict using the ARIMA model
-    y_pred_arima = arima_model.predict(n_periods=len(testing_data))
-
-    # Calculate MAPE for ARIMA
-    mape_arima = mean_absolute_percentage_error(y_test, y_pred_arima)
-    print(f"ARIMA MAPE: {mape_arima * 100:.2f}%")
-
-    # **Plotting: Actual vs Predicted Values for Linear Regression and ARIMA**
-    plt.figure(figsize=(12, 6))
-    plt.plot(y_test.index, y_test, label="Actual Values", color="blue")
-    plt.plot(y_test.index, y_pred_lr, label="Linear Regression Predictions", color="green", linestyle='--')
-    plt.plot(y_test.index, y_pred_arima, label="ARIMA Predictions", color="red", linestyle='--')
-    plt.xlabel("Date")
-    plt.ylabel("Last Close Price")
-    plt.title("Actual vs Predicted Values for Linear Regression and ARIMA")
-    plt.legend()
-    plt.show()
-
-    return mape_lr, mape_arima
-
-def main():
-    # Define your file paths here
-    training_file = 'train.csv'
-    testing_file = 'test.csv'
+# Define the LSTM model
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_layer_size, num_layers, output_size):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_layer_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_layer_size, output_size)
     
-    # Calculate MAPE for both models
-    mape_lr, mape_arima = calculate_mape(training_file, testing_file)
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        # Get the last time-step output from the LSTM
+        last_lstm_output = lstm_out[:, -1, :]
+        output = self.fc(last_lstm_output)
+        return output
 
-    print(f"Linear Regression MAPE: {mape_lr * 100:.2f}%")
-    print(f"ARIMA MAPE: {mape_arima * 100:.2f}%")
+# Function to preprocess the data (scaling)
+def preprocess_data(df, feature_columns):
+    df = df[feature_columns]
+    
+    # Initialize the MinMaxScaler
+    scaler = MinMaxScaler()
+    
+    # Scale the features
+    df_scaled = scaler.fit_transform(df.values)
+    
+    return df_scaled, scaler
 
-if __name__ == "__main__":
-    main()
+# Function to create sequences for LSTM
+def create_sequences(data, seq_length):
+    X = []
+    y = []
+    
+    for i in range(len(data) - seq_length):
+        X.append(data[i:i+seq_length])
+        y.append(data[i+seq_length, 0])  # Predict the next day's 'Open' price
+    
+    return np.array(X), np.array(y)
+
+# Function to evaluate the model
+def evaluate_model(model, X_test, y_test):
+    model.eval()  # Set model to evaluation mode
+    with torch.no_grad():
+        y_pred = model(X_test)
+    
+    # Calculate MAPE (Mean Absolute Percentage Error)
+    y_pred_np = y_pred.cpu().numpy()
+    y_test_np = y_test.cpu().numpy()
+    mape = mean_absolute_percentage_error(y_test_np, y_pred_np)
+    
+    return mape, y_pred
+
+# Main function
+def main(args):
+    """ Main entry point of the app """
+    train_file = args.training_file
+    test_file = args.testing_file
+    
+    # Load train and test datasets
+    train_data = pd.read_csv(train_file)
+    test_data = pd.read_csv(test_file)
+    
+    # Define feature columns based on your dataset
+    feature_columns = ['Open', 'High', 'Low', 'Last Close']  # Corrected feature column names
+    
+    # Preprocess training and testing data
+    train_scaled, scaler = preprocess_data(train_data, feature_columns)
+    test_scaled, _ = preprocess_data(test_data, feature_columns)
+
+    # Create sequences for LSTM input
+    seq_length = 60  # Number of previous days to consider for prediction
+    X_train, y_train = create_sequences(train_scaled, seq_length)
+    X_test, y_test = create_sequences(test_scaled, seq_length)
+
+    # Convert to PyTorch tensors
+    X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+    y_train_tensor = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
+    X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+    y_test_tensor = torch.tensor(y_test, dtype=torch.float32).view(-1, 1)
+
+    # Initialize the LSTM model
+    model = LSTMModel(input_size=X_train.shape[2], hidden_layer_size=50, num_layers=2, output_size=1)
+
+    # Define the loss function and optimizer
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    # Train the model
+    epochs = 10
+    for epoch in range(epochs):
+        model.train()  # Set model to training mode
+        optimizer.zero_grad()
+        
+        y_pred_train = model(X_train_tensor)
+        loss = criterion(y_pred_train, y_train_tensor)
+        
+        loss.backward()
+        optimizer.step()
+
+        print(f"Epoch {epoch+1}/{epochs}, Loss: {loss.item()}")
+
+    # Evaluate the model on the test data
+    mape, y_pred_test = evaluate_model(model, X_test_tensor, y_test_tensor)
+    
+    print(f"MAPE on the test set: {mape}")
+
+    # Optionally: inverse transform predictions to original scale
+    y_pred_test_original = scaler.inverse_transform(y_pred_test.cpu().numpy())
+    y_test_original = scaler.inverse_transform(y_test_tensor.cpu().numpy())
+
+    print("Test predictions: ", y_pred_test_original)
+    print("Actual values: ", y_test_original)
+
+# If running as a script, process arguments and execute the main function
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('training_file', type=str, help='Path to the training data CSV')
+    parser.add_argument('testing_file', type=str, help='Path to the testing data CSV')
+    
+    args = parser.parse_args()
+    
+    main(args)
