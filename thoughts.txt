@@ -5,3 +5,39 @@ d > 1 leads to over-differencing
 Seasonal = true, stepwise = true (does all possible combinations), trace = true (prints all in command)
 can make lower MAPE with d = 3, but this is because it destroys certain information from the data
 so best arima paremeters are (0,1,0) according to auto_arima
+
+Since statsmodels library is not on the list, we need to rewrite the arima model using only allowed libraries
+The ARIMA modeling will be implemented from scratch, using the Box-Jenkins methodology.
+This includes differencing for stationarity and solving AR/MA coefficients manually.
+
+Sequence length = 80 : {
+
+With EPOCH 100 : 
+Learning rate 0.001 ==> MAPE 7.47%
+Learning rate 0.01 ==> MAPE 4.97%
+Learning rate 0.02 ==> MAPE 4.35%
+Learning rate 0.05 ==> MAPE 2.96%
+Learning rate 0.07 ==> MAPE 5.99%
+Learning rate 0.10 ==> MAPE 6.42%
+
+With EPOCH 357 : 
+Learning rate 0.001 ==> MAPE 5.09%
+Learning rate 0.01 ==> MAPE 4.36%
+Learning rate 0.02 ==> MAPE 3.00%
+Learning rate 0.05 ==> MAPE 4.27%
+
+}
+
+Sequence length 30 : bad results, not enough for 5 years of data
+Sequence length 60 : bad results
+Sequence length 90 : bad results
+
+
+Abdel : Hidden_size = 50, num_layers = 5, sequence length = 80 ==> goede plot, 2.3% mape 
+Joris : Hidden_size = 50, num_layers = 5, sequence length = 80 ==> decent plot, 3.41% mape
+Abdel : Hidden_size = 50, num_layers = 10, ...			=> slecht, 25% mape
+hidden_size=100, num_layers=5, output_size=1			 ==> slechte shape, 3.94% mape
+hidden_size=64, num_layers=2, output_size=21 ==> 
+
+Important parameters : time_steps, batch_size, hidden_size, num_layers, learning_rate, num_epochs
+Best parameters: hidden_size = 20, num_layers = 1, learning_rate = 0.005, num_epochs = 50
