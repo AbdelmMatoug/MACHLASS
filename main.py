@@ -12,6 +12,7 @@ import random
 import joblib
 from itertools import product
 
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -44,7 +45,7 @@ def set_seed(seed):
     torch.use_deterministic_algorithms(True)
 
 # Load and preprocess data
-def load_data(file_path, sequence_length=60, feature_cols=None, target_col=None, split_ratio=0.7):
+def load_data(file_path, sequence_length=60, feature_cols=None, target_col=None, split_ratio=0.98728813559322033898305084745763):
     logging.info(f"Loading data from {file_path}...")
     data = pd.read_csv(file_path)
     data['Date'] = pd.to_datetime(data['Date'], format='%m/%d/%Y')
@@ -287,19 +288,24 @@ def main(args):
     # Check if a saved model exists
     model_path = 'best_model_final.pth'
     if os.path.exists(model_path):
-        response = input("A saved model exists. Do you want to train a new model? (yes/no): ").strip().lower()
+        response = input(
+            "A saved model exists. This model was made using October 2024 as validation data for tuning the parameters. "
+            "If you use October 2024 as test data, the MAPE will be around 0 so you should type yes and train a new model. "
+            "Or you can use different test data (for example November 2024). Do you want to train a new model? (yes/no): "
+        ).strip().lower()
     else:
         response = "yes"  # If no saved model exists, force training
 
     if response == "yes":
         logging.info("Starting model training...")
         param_grid = {
-            'hidden_size': [32, 64, 128],
-            'num_layers': [1, 2, 3,4, 5],
-            'learning_rate': [0.01,0.001, 0.0001, 0.005],
-            'batch_size': [16, 32, 64],
-            'num_epochs': [50, 100,150]
+            'hidden_size': [32],          # 3 options
+            'num_layers': [1, 2],         # 4 options
+            'learning_rate': [0.005, 0.001],  # 2 options
+            'batch_size': [32, 64],       # 3 options
+            'num_epochs': [50]            # 2 options
         }
+
         best_params = grid_search(X_train, y_train, X_val, y_val, param_grid, device)
         logging.debug(f"Grid Search Parameters: {param_grid}")
         logging.debug(f"Best Parameters: {best_params}")
@@ -340,7 +346,7 @@ def main(args):
     test_actual = test_data[target_col].values
     plot_predictions(
         test_dates, test_actual, test_predictions,
-        title=f"Best Model Predictions", filename="best_model_predictions.png"
+        title="Best Model Predictions", filename="best_model_predictions.png"
     )
     test_scaled_data = scaler.transform(test_data[feature_cols + [target_col]].dropna())
     logging.info(f"Test data scaled range: {test_scaled_data.min(axis=0)} to {test_scaled_data.max(axis=0)}")
@@ -348,7 +354,6 @@ def main(args):
     mape = mean_absolute_percentage_error(test_actual, test_predictions)
     print(test_predictions)
     logging.info(f"Final Test MAPE: {mape:.4f}")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
