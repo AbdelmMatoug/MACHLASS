@@ -5,12 +5,15 @@ import torch
 import torch.nn as nn
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_percentage_error
-import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
-from itertools import product
-from tqdm import tqdm
+import matplotlib.pyplot as plt
+import logging
 import random
 import joblib
+from itertools import product
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Define LSTM model
 class LSTMModel(nn.Module):
@@ -18,7 +21,7 @@ class LSTMModel(nn.Module):
         super(LSTMModel, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, output_size)
 
     def forward(self, x):
@@ -28,6 +31,7 @@ class LSTMModel(nn.Module):
         out = self.fc(out[:, -1, :])
         return out
 
+# Seed for reproducibility
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -38,22 +42,21 @@ def set_seed(seed):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
     torch.use_deterministic_algorithms(True)
-# Load data
-def load_data(file_path):
-    try:
-        data = pd.read_csv(file_path)
-        data['Date'] = pd.to_datetime(data['Date'], format='%m/%d/%Y')
-        data = data.sort_values(by='Date')
-        return data
-    except Exception as e:
-        raise ValueError(f"Error loading {file_path}: {e}")
 
-# Preprocess data
-def preprocess_data(data, feature_cols, target_col, sequence_length=60):
+# Load and preprocess data
+def load_data(file_path, sequence_length=60, feature_cols=None, target_col=None, split_ratio=0.7):
+    logging.info(f"Loading data from {file_path}...")
+    data = pd.read_csv(file_path)
+    data['Date'] = pd.to_datetime(data['Date'], format='%m/%d/%Y')
+    data = data.sort_values(by='Date')
+    logging.info(f"Data loaded. Total records: {len(data)}")
+
     if not all(col in data.columns for col in feature_cols + [target_col]):
         raise ValueError("Missing required columns in the dataset.")
 
+    dates = data['Date']
     data = data[feature_cols + [target_col]].dropna()
+
     scaler = MinMaxScaler()
     scaled_data = scaler.fit_transform(data)
 
@@ -62,27 +65,53 @@ def preprocess_data(data, feature_cols, target_col, sequence_length=60):
         X.append(scaled_data[i-sequence_length:i, :-1])
         y.append(scaled_data[i, -1])
 
-    X = np.array(X)
-    y = np.array(y)
+    X, y = np.array(X), np.array(y)
 
-    # Save scaler for reproducibility
+    split_idx = int(len(X) * split_ratio)
+    if split_idx < 1 or len(X) - split_idx < 1:
+        raise ValueError("Split ratio results in insufficient training or validation data.")
+
+    X_train, y_train = X[:split_idx], y[:split_idx]
+    X_val, y_val = X[split_idx:], y[split_idx:]
+
+    logging.info(f"Training data date range: {dates.iloc[:split_idx].min()} to {dates.iloc[:split_idx].max()}")
+    logging.info(f"Validation data date range: {dates.iloc[split_idx:].min()} to {dates.iloc[split_idx:].max()}")
+    logging.info(f"Time-based split: {len(X_train)} training samples, {len(X_val)} validation samples.")
+    logging.info(f"Training data scaled range: {scaled_data[:split_idx].min(axis=0)} to {scaled_data[:split_idx].max(axis=0)}")
+    logging.info(f"Validation data scaled range: {scaled_data[split_idx:].min(axis=0)} to {scaled_data[split_idx:].max(axis=0)}")
+    logging.debug(f"Data Head:\n{data.head()}")
+    logging.debug(f"Feature Scaling Ranges (Training): Min {scaled_data[:split_idx].min(axis=0)}, Max {scaled_data[:split_idx].max(axis=0)}")
+    logging.debug(f"Feature Scaling Ranges (Validation): Min {scaled_data[split_idx:].min(axis=0)}, Max {scaled_data[split_idx:].max(axis=0)}")
+
     joblib.dump(scaler, 'scaler.pkl')
+    return (
+        torch.tensor(X_train, dtype=torch.float32),
+        torch.tensor(y_train, dtype=torch.float32),
+        torch.tensor(X_val, dtype=torch.float32),
+        torch.tensor(y_val, dtype=torch.float32),
+        scaler
+    )
 
-    return torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.float32), scaler
-
-# Train model
-def train_model(model, X_train, y_train, num_epochs=100, learning_rate=0.001, batch_size=32, shuffle=True, seed=42):
-    set_seed(seed)  # Reset seed for reproducibility
+def train_model(model, X_train, y_train, X_val=None, y_val=None, num_epochs=100, learning_rate=0.001, batch_size=32):
+    logging.info("Starting training...")
     dataset = TensorDataset(X_train, y_train)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, drop_last=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    model.train()
+
+    best_val_loss = float('inf')
+    config = {
+        'input_size': model.lstm.input_size,
+        'hidden_size': model.hidden_size,
+        'num_layers': model.num_layers,
+        'output_size': model.fc.out_features
+    }
 
     for epoch in range(num_epochs):
-        epoch_loss = 0.0
-        for batch_X, batch_y in dataloader:
+        model.train()
+        train_loss = 0.0
+        for i, (batch_X, batch_y) in enumerate(dataloader):
             batch_X, batch_y = batch_X.to(model.fc.weight.device), batch_y.to(model.fc.weight.device)
 
             optimizer.zero_grad()
@@ -91,192 +120,235 @@ def train_model(model, X_train, y_train, num_epochs=100, learning_rate=0.001, ba
             loss.backward()
             optimizer.step()
 
-            epoch_loss += loss.item()
+            train_loss += loss.item()
+            if (i + 1) % 10 == 0:  # Log every 10 batches
+                logging.debug(f"Epoch {epoch + 1}, Batch {i + 1}/{len(dataloader)}, Batch Loss: {loss.item():.4f}")
 
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss / len(dataloader):.4f}")
+        if X_val is not None and y_val is not None:
+            model.eval()
+            with torch.no_grad():
+                val_outputs = model(X_val.to(model.fc.weight.device)).squeeze(-1).cpu().numpy()
+                val_loss = criterion(torch.tensor(val_outputs), y_val.to(model.fc.weight.device)).item()
+                val_actual = y_val.cpu().numpy()
+                mape = mean_absolute_percentage_error(val_actual, val_outputs)
+            if epoch % 10 == 0 or epoch == num_epochs - 1:  # Log only every 10th epoch or the final epoch
 
-# Predict with continuation
-def predict_with_continuation(model, X_train, test_data_length, scaler, feature_cols):
+                logging.info(
+                    f"Epoch [{epoch+1}/{num_epochs}] | Train Loss: {train_loss / len(dataloader):.4f} | "
+                    f"Val Loss: {val_loss:.4f} | Val MAPE: {mape:.4f}"
+                )
+
+            if val_loss < best_val_loss:
+                logging.debug(f"New Best Validation Loss: {val_loss:.4f}")
+                best_val_loss = val_loss
+                torch.save({'model_state_dict': model.state_dict(), 'config': config}, 'best_model.pth')
+
+        else:
+            if epoch % 10 == 0 or epoch == num_epochs - 1:  # Log only every 10th epoch or the final epoch
+                logging.info(f"Epoch [{epoch+1}/{num_epochs}] | Train Loss: {train_loss / len(dataloader):.4f}")
+
+    logging.info("Training complete.")
+
+
+from tqdm import tqdm
+
+from tqdm import tqdm
+import time
+
+def grid_search(X_train, y_train, X_val, y_val, param_grid, device):
+    logging.info("Starting grid search...")
+    param_combinations = list(product(*param_grid.values()))
+    total_combinations = len(param_combinations)
+    best_mape = float('inf')
+    best_params = None
+    best_checkpoint = None  # To store the best model's checkpoint
+
+    # Initialize the progress bar
+    with tqdm(total=total_combinations, desc="Grid Search Progress", unit="combination") as pbar:
+        start_time = time.time()  # Track start time
+
+        for idx, param_set in enumerate(param_combinations):
+            params = dict(zip(param_grid.keys(), param_set))
+            logging.info(f"Testing parameters {idx+1}/{total_combinations}: {params}")
+
+            model = LSTMModel(
+                input_size=X_train.shape[2],
+                hidden_size=params['hidden_size'],
+                num_layers=params['num_layers'],
+                output_size=1
+            ).to(device)
+
+            # Train the model and save the checkpoint
+            train_model(
+                model, X_train, y_train, X_val, y_val,
+                num_epochs=params['num_epochs'],
+                learning_rate=params['learning_rate'],
+                batch_size=params['batch_size']
+            )
+
+            # Load checkpoint for evaluation
+            checkpoint = torch.load('best_model.pth', map_location=device)
+            config = checkpoint['config']
+            logging.info(f"Loaded model configuration: {config}")
+            model.load_state_dict(checkpoint['model_state_dict'])  # Load model state
+            model.eval()
+
+            # Evaluate the model on validation data
+            with torch.no_grad():
+                val_predictions = model(X_val.to(device)).squeeze(-1).cpu().numpy()
+                val_actual = y_val.cpu().numpy()
+                mape = mean_absolute_percentage_error(val_actual, val_predictions)
+
+            logging.info(f"Validation Results | Parameters: {params} | MAPE: {mape:.4f}")
+            logging.debug(f"Validation MAPE for parameters {params}: {mape:.4f}")
+
+            if mape < best_mape:
+                logging.debug(f"New Best MAPE: {mape:.4f} with parameters {params}")
+                best_mape = mape
+                best_params = params
+                best_checkpoint = checkpoint  # Save the best checkpoint
+
+            # Update progress bar
+            elapsed_time = time.time() - start_time
+            avg_time_per_combination = elapsed_time / (idx + 1)
+            remaining_time = avg_time_per_combination * (total_combinations - idx - 1)
+            pbar.set_postfix({
+                "Best MAPE": f"{best_mape:.4f}",
+                "ETA": f"{remaining_time:.2f}s"
+            })
+            pbar.update(1)
+
+    # Save the best checkpoint to use later
+    torch.save(best_checkpoint, 'best_model_final.pth')
+    logging.info(f"Best parameters: {best_params} | Best MAPE: {best_mape:.4f}")
+    return best_params
+
+
+def predict_future(model, input_data, prediction_steps, scaler, feature_cols):
+    logging.info("Starting future predictions...")
     model.eval()
-    with torch.no_grad():
-        predictions = []
-        current_input = X_train[-1].unsqueeze(0)
+    predictions = []
+    current_input = input_data.clone()
 
-        for _ in range(test_data_length):
-            prediction = model(current_input).squeeze(-1)
+    with torch.no_grad():
+        for step in range(prediction_steps):
+            prediction = model(current_input.unsqueeze(0)).squeeze(-1)
             predictions.append(prediction.item())
 
             next_input = torch.zeros_like(current_input)
-            next_input[0, :-1, :] = current_input[0, 1:, :]
-            next_input[0, -1, :] = prediction.unsqueeze(-1)
+            next_input[:-1, :] = current_input[1:, :]
+            next_input[-1, :] = torch.tensor(prediction.item(), dtype=torch.float32)
             current_input = next_input
+
+            if (step + 1) % 5 == 0:
+                logging.info(f"Step {step + 1} | Predicted: {prediction.item():.4f} | Input: {current_input[-1].cpu().numpy()}")
+  
 
     predictions = np.array(predictions).reshape(-1, 1)
     inv_predictions = np.zeros((len(predictions), len(feature_cols) + 1))
     inv_predictions[:, -1] = predictions[:, 0]
     inv_predictions = scaler.inverse_transform(inv_predictions)
 
+    logging.info(f"Final Scaled Predictions Range: Min {predictions.min():.4f}, Max {predictions.max():.4f}")
     return inv_predictions[:, -1]
 
-# Plot predictions
-def plot_predictions(test_dates, test_actual, test_predicted, filename, param_dict, mape):
+def plot_predictions(dates, actual, predicted, title, filename):
+    logging.info("Plotting predictions...")
     plt.figure(figsize=(12, 6))
-    plt.plot(test_dates, test_actual, label='Test Actual', marker='o', color='blue')
-    plt.plot(test_dates, test_predicted, label='Test Predicted', marker='x', color='orange')
+    plt.plot(dates, actual, label='Actual', marker='o', color='blue')
+    plt.plot(dates, predicted, label='Predicted', marker='x', color='orange')
     plt.xlabel('Date')
     plt.ylabel('Price')
-    plt.title(f"Hidden: {param_dict['hidden_size']}, Layers: {param_dict['num_layers']}, LR: {param_dict['learning_rate']:.5f}, Batch: {param_dict['batch_size']}, Epochs: {param_dict['num_epochs']}, SeqLen: {param_dict['sequence_length']}, MAPE: {mape:.2f}%")
+    plt.title(title)
     plt.legend()
     plt.grid(True)
-    try:
-        plt.savefig(filename)
-        print(f"Plot saved as {filename}")
-    except Exception as e:
-        print(f"Error saving plot: {e}")
+    plt.savefig(filename)
     plt.close()
+    logging.info(f"Plot saved as {filename}")
 
-# Calculate MAPE
-def calculate_mape(actual, predicted):
-    actual, predicted = np.array(actual), np.array(predicted)
-    return np.mean(np.abs((actual - predicted) / (actual + 1e-8))) * 100
-
-def grid_search(args, parameter_grid, max_runs=None):
-    set_seed(42)  # Reset seed
-    train_data = load_data(args.training_file)
-    test_data = load_data(args.testing_file)
-
-    feature_cols = ['Open', 'High', 'Low']
-    target_col = 'Last Close'
-
-    sequence_length = max(parameter_grid.get('sequence_length', [1]))
-    X_train, y_train, scaler = preprocess_data(train_data, feature_cols, target_col, sequence_length)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    best_mape = float('inf')
-    best_params = None
-
-    param_combinations = list(product(*parameter_grid.values()))
-    if max_runs and max_runs < len(param_combinations):
-        param_combinations = random.sample(param_combinations, max_runs)
-    total_runs = len(param_combinations)
-
-    with tqdm(total=total_runs, desc="Grid Search Progress") as pbar:
-        for idx, params in enumerate(param_combinations):
-            set_seed(42)
-            param_dict = dict(zip(parameter_grid.keys(), params))
-            print(f"Run {idx + 1}/{total_runs}, Testing parameters: {param_dict}")
-
-            model = LSTMModel(
-                input_size=len(feature_cols),
-                hidden_size=param_dict['hidden_size'],
-                num_layers=param_dict['num_layers'],
-                output_size=1
-            ).to(device)
-
-            X_train, y_train = X_train.to(device), y_train.to(device)
-
-            try:
-                train_model(
-                    model,
-                    X_train,
-                    y_train,
-                    num_epochs=param_dict['num_epochs'],
-                    learning_rate=param_dict['learning_rate'],
-                    batch_size=param_dict['batch_size'],
-                    shuffle=False
-                )
-
-                test_predictions = predict_with_continuation(model, X_train, len(test_data), scaler, feature_cols)
-                test_actual = test_data['Last Close'].iloc[:len(test_predictions)].values
-                mape = calculate_mape(test_actual, test_predictions)
-
-                print(f"MAPE for parameters {param_dict}: {mape:.2f}%")
-
-                if mape < best_mape:
-                    best_mape = mape
-                    best_params = param_dict
-                    torch.save(model.state_dict(), 'best_model.pth')  # Save best model state
-                    print(f"New best parameters found with MAPE: {best_mape:.2f}%")
-
-            except Exception as e:
-                print(f"Error with parameters {param_dict}: {e}")
-
-            pbar.update(1)
-
-    print(f"Best parameters: {best_params}")
-    print(f"Best MAPE: {best_mape:.2f}%")
-    return best_params
-
+# Main function
+import os
 
 def main(args):
     set_seed(42)
+    logging.info("Starting the process...")
 
-    # Check if a pre-trained model exists
-    if torch.cuda.is_available() and torch.backends.cudnn.version() and os.path.exists('best_model.pth'):
-        print("Using saved model for prediction.")
-        
-        train_data = load_data(args.training_file)
-        test_data = load_data(args.testing_file)
+    feature_cols = ['Open', 'High', 'Low', 'Last Close']
+    target_col = 'Last Close'
+    logging.debug(f"Feature Columns: {feature_cols}, Target Column: {target_col}")
 
-        feature_cols = ['Open', 'High', 'Low']
-        target_col = 'Last Close'
+    logging.info("Loading and preprocessing training data...")
+    X_train, y_train, X_val, y_val, scaler = load_data(
+        args.training_file, feature_cols=feature_cols, target_col=target_col
+    )
 
-        # Reload the scaler
-        scaler = joblib.load('scaler.pkl')
-        sequence_length = 20  # Ensure this matches the sequence length used during training
-        
-        # Preprocess test data
-        X_train, y_train, _ = preprocess_data(train_data, feature_cols, target_col, sequence_length)
-        
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # Load the model
-        model = LSTMModel(
-            input_size=len(feature_cols),
-            hidden_size=32,  # Match the best parameters from saved training
-            num_layers=2,  # Match the best parameters from saved training
-            output_size=1
-        ).to(device)
-
-        # Load saved weights
-        model.load_state_dict(torch.load('best_model.pth'))
-        model.eval()  # Set to evaluation mode
-
-        # Generate predictions
-        test_predictions = predict_with_continuation(model, X_train, len(test_data), scaler, feature_cols)
-        test_actual = test_data['Last Close'].iloc[:len(test_predictions)].values
-        mape = calculate_mape(test_actual, test_predictions)
-
-        print(f"Final Model MAPE on Test Data: {mape:.2f}%")
-
-        # Plot predictions
-        final_plot_filename = f"final_hidden32_layers2_lr0.005_batch64_epochs50_seq20_mape{mape:.2f}.png"
-        plot_predictions(test_data['Date'], test_actual, test_predictions, final_plot_filename, {
-            'hidden_size': 32,
-            'num_layers': 2,
-            'learning_rate': 0.005,
-            'batch_size': 64,
-            'num_epochs': 50,
-            'sequence_length': 20
-        }, mape)
+    # Check if a saved model exists
+    model_path = 'best_model_final.pth'
+    if os.path.exists(model_path):
+        response = input("A saved model exists. Do you want to train a new model? (yes/no): ").strip().lower()
     else:
-        print("No pre-trained model found. Running grid search and training.")
-        parameter_grid = {
-            'hidden_size': [32, 64],
-            'num_layers': [1, 2],
-            'learning_rate': [0.001, 0.005],
-            'batch_size': [32, 64],
-            'num_epochs': [50],
-            'sequence_length': [20]
+        response = "yes"  # If no saved model exists, force training
+
+    if response == "yes":
+        logging.info("Starting model training...")
+        param_grid = {
+            'hidden_size': [32, 64, 128],
+            'num_layers': [1, 2, 3,4, 5],
+            'learning_rate': [0.01,0.001, 0.0001, 0.005],
+            'batch_size': [16, 32, 64],
+            'num_epochs': [50, 100,150]
         }
-
+        best_params = grid_search(X_train, y_train, X_val, y_val, param_grid, device)
+        logging.debug(f"Grid Search Parameters: {param_grid}")
+        logging.debug(f"Best Parameters: {best_params}")
+        checkpoint = torch.load('best_model_final.pth', map_location=device)
+        config = checkpoint['config']
+    else:
+        logging.info(f"Loading existing model from {model_path}...")
         try:
-            best_params = grid_search(args, parameter_grid)
+            checkpoint = torch.load(model_path, map_location=device)
+            config = checkpoint['config']
+        except FileNotFoundError:
+            logging.error("No saved model found. Please train a model first.")
+            return
+        except KeyError as e:
+            logging.error(f"Missing key in checkpoint: {e}")
+            return
+        except RuntimeError as e:
+            logging.error(f"Error loading the model state_dict: {e}")
+            return
 
-            print(f"Best parameters: {best_params}")
-        except Exception as e:
-            print(f"An error occurred during grid search or final testing: {e}")
+    model = LSTMModel(
+        input_size=config['input_size'],
+        hidden_size=config['hidden_size'],
+        num_layers=config['num_layers'],
+        output_size=config['output_size']
+    ).to(device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    logging.info("Model loaded successfully.")
+
+    logging.info("Loading and processing test data...")
+    test_data = pd.read_csv(args.testing_file)
+    test_dates = pd.to_datetime(test_data['Date'], format='%m/%d/%Y')
+    test_predictions = predict_future(
+        model, X_train[-1, :, :], len(test_data), scaler, feature_cols
+    )
+
+    logging.info("Predictions complete. Plotting results...")
+    test_actual = test_data[target_col].values
+    plot_predictions(
+        test_dates, test_actual, test_predictions,
+        title=f"Best Model Predictions", filename="best_model_predictions.png"
+    )
+    test_scaled_data = scaler.transform(test_data[feature_cols + [target_col]].dropna())
+    logging.info(f"Test data scaled range: {test_scaled_data.min(axis=0)} to {test_scaled_data.max(axis=0)}")
+
+    mape = mean_absolute_percentage_error(test_actual, test_predictions)
+    print(test_predictions)
+    logging.info(f"Final Test MAPE: {mape:.4f}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
